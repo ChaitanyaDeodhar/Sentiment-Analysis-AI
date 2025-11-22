@@ -5,7 +5,8 @@ from transformers import BertTokenizer, BertForSequenceClassification  # For BER
 from sklearn.model_selection import train_test_split  # For splitting data
 from sklearn.metrics import accuracy_score  # For evaluating accuracy
 import numpy as np  # For numerical operations
-
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
 
 # Check if GPU is available
 print("Checking GPU availability...")
@@ -16,8 +17,6 @@ else:
     print("GPU is not available. Using CPU instead.")
 
 # Step 1: Load the data
-# Replace 'path_to_your_file.xlsx' with the actual path to your benchmark Excel file
-# If your file has multiple sheets, specify the sheet name (e.g., sheet_name='Sheet1')
 file_path = 'benchmark-test.xlsx'  # Example: 'benchmark_data.xlsx'
 sheet_name = 'Sheet1'  # Change this if your benchmark is on a different sheet
 
@@ -52,12 +51,10 @@ else:
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['label'])
     print(f"Training set: {len(train_df)} rows, Testing set: {len(test_df)} rows")
 
-    # Continue with the rest of the code as before...
-
 
 # Step 4: Prepare the data for BERT
-# Load the BERT tokenizer (multilingual version for Polish)
-tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+# Load the BERT tokenizer (Polish specific)
+tokenizer = BertTokenizer.from_pretrained('dkleczek/bert-base-polish-cased-v1')
 
 
 # Function to tokenize the text
@@ -80,7 +77,7 @@ test_inputs, test_labels = tokenize_data(test_df)
 # Step 5: Set up the BERT model
 # We're using BertForSequenceClassification for sentiment analysis (it has 3 classes: negative, neutral, positive)
 model = BertForSequenceClassification.from_pretrained(
-    'bert-base-multilingual-cased',
+    'dkleczek/bert-base-polish-cased-v1',
     num_labels=3  # 3 classes: negative (0), neutral (1), positive (2)
 )
 
@@ -88,6 +85,8 @@ model = BertForSequenceClassification.from_pretrained(
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 print(f"Using device: {device}")
+optimizer = AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)  # Lower LR, add weight decay
+scheduler = StepLR(optimizer, step_size=5, gamma=0.5)  # New: LR scheduler
 
 # Step 6: Fine-tune the model (this is where training happens)
 # For now, we'll just outline the training loop. You can run this part after your meeting if needed.
@@ -98,44 +97,63 @@ from torch.optim import AdamW  # Optimizer for BERT
 train_dataset = TensorDataset(train_inputs['input_ids'].to(device),
                               train_inputs['attention_mask'].to(device),
                               train_labels.to(device))
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True) # Batch size=16; changed to 8
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True) # Batch size=16; changed to 8
 
 test_dataset = TensorDataset(test_inputs['input_ids'].to(device),
                              test_inputs['attention_mask'].to(device),
                              test_labels.to(device))
-test_loader = DataLoader(test_dataset, batch_size=8)
+test_loader = DataLoader(test_dataset, batch_size=32)
 
 # Training loop
 optimizer = AdamW(model.parameters(), lr=5e-5)  # Learning rate; common for BERT
 model.train()  # Set model to training mode
 
-num_epochs = 3  # Start with 3 epochs; you can increase this
+# Early stopping setup
+best_accuracy = 0.0  # Track the best test accuracy
+patience = 3  # Number of epochs to wait for improvement (adjust as needed, e.g., 2-5)
+no_improve_count = 0  # Counter for epochs without improvement
+
+num_epochs = 10  # Increase epochs here (e.g., from 5 to 10)
+
 for epoch in range(num_epochs):
-    for batch in train_loader:
-        optimizer.zero_grad()  # Clear gradients
-        inputs, masks, labels = batch  # Unpack batch
-        outputs = model(inputs, attention_mask=masks, labels=labels)  # Forward pass
-        loss = outputs.loss  # Get loss
-        loss.backward()  # Backward pass
-        optimizer.step()  # Update weights
-
-    print(f'Epoch {epoch + 1} completed')
-
-# Step 7: Evaluate the model on the test set
-model.eval()  # Set model to evaluation mode
-predictions = []
-true_labels = []
-
-with torch.no_grad():  # No gradients needed for evaluation
-    for batch in test_loader:
+    model.train()  # Set model to training mode
+    for batch in train_loader:  # Training batches
+        optimizer.zero_grad()
         inputs, masks, labels = batch
-        outputs = model(inputs, attention_mask=masks)
-        logits = outputs.logits  # Get the model's predictions
-        preds = torch.argmax(logits, dim=1)  # Get the predicted class
-        predictions.extend(preds.cpu().numpy())  # Save predictions
-        true_labels.extend(labels.cpu().numpy())  # Save true labels
+        outputs = model(inputs, attention_mask=masks, labels=labels)  # Include labels for loss
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+    scheduler.step()  # Update LR
 
-accuracy = accuracy_score(true_labels, predictions)
-print(f'Test Accuracy: {accuracy * 100:.2f}%')
+    # Evaluation after each epoch (moved here for clarity)
+    model.eval()  # Set model to evaluation mode
+    predictions = []
+    true_labels = []
+    with torch.no_grad():
+        for batch in test_loader:  # Use test_loader for validation
+            inputs, masks, labels = batch
+            outputs = model(inputs, attention_mask=masks)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=1)
+            predictions.extend(preds.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+    
+    # Calculate accuracy
+    accuracy = accuracy_score(true_labels, predictions)
+    print(f'Epoch {epoch+1}/{num_epochs}: Test Accuracy: {accuracy * 100:.2f}%')
+    
+    # Early stopping logic
+    if accuracy > best_accuracy:
+        best_accuracy = accuracy
+        no_improve_count = 0  # Reset counter if improved
+    else:
+        no_improve_count += 1
+        if no_improve_count >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs. Best accuracy: {best_accuracy * 100:.2f}%")
+            break  # Stop training
 
-# Now you can use the trained model for your full dataset (more on that below)
+# After training, you can print final results or save the model
+print(f"Training complete. Best accuracy achieved: {best_accuracy * 100:.2f}%")
+
+
